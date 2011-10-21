@@ -1,0 +1,304 @@
+<?php
+
+/**
+ * @file
+ * hooks and api for adserve
+ */ 
+
+// adserve module 
+// menu - settings page, report page, server handler, client handler
+
+// handler for communications - see blink for key, verification
+
+// simple version uses no verification 
+
+// set server domain, only accept requests from that domain
+// send all watchdog messages?
+
+/**
+ * Implements hook_menu().
+ */
+function adserve_menu() { 
+  $items['admin/config/system/adserve'] = array(
+    'title' => 'Ad Serve',
+    'description' => 'Simple ad server with a/b testing',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('adserve_admin_settings'),
+    'access arguments' => array('administer site configuration'), 
+    'file' => 'adserve_admin.inc', 
+  ); 
+  $items['admin/config/system/adserve/settings'] = array(
+    'title' => 'Settings',
+    'description' => 'Simple ad server with a/b testing',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('adserve_admin_settings'), 
+    'access arguments' => array('administer site configuration'),
+    'file' => 'adserve_admin.inc',
+    'type'     => MENU_LOCAL_TASK,
+    'weight' => -10,
+  ); 
+  
+  $items['admin/config/system/adserve/report'] = array(
+    'title' => 'Report',
+    'description' => 'Adserve Report',
+    'page callback' => 'adserve_basic_report', 
+    'access arguments' => array('administer site configuration'),
+    'file' => 'adserve_admin.inc',
+    'type'     => MENU_LOCAL_TASK,
+    'weight' => -5,
+  );
+   
+   
+   /*
+  $items['admin/adserve/updates'] = array( 
+    'page callback' => 'adserve_updates',
+    'file' => 'adserve_admin.inc', 
+    'access callback' => TRUE,
+    'type'  => MENU_CALLBACK, // remote REST call to request shared log events
+  );  
+  */
+    
+  return $items;
+  
+}
+
+/**
+ * Implements hook_cron().
+ */
+function adserve_cron() {
+  include_once('adserve_admin.inc');
+  // periodically do someting
+  adserve_cronjob();
+}
+
+function adserve_form_adserve_node_form_alter(&$form, &$form_state, $form_id) { 
+  // our node form
+  drupal_add_css(drupal_get_path('module', 'adserve') . '/adserve_form.css');
+  drupal_add_js(drupal_get_path('module', 'adserve') . '/adserve_form.js');
+  $form['title']['#description'] = t('Maximum 25 characters'); 
+  $form['title']['#field_suffix'] =  "<div id='adserve-title-len'>0</div>";  
+  $form['adserve_display_desc']['#prefix'] = "<div id='adserve-disp-text-len'>0</div>"; 
+  $form['adserve_display_url']['#prefix'] = "<div id='adserve-disp-url-len'>0</div>"; 
+  $form['adserve_weight'][LANGUAGE_NONE][0]['#default_value'] = "1"; 
+   // drupal_set_message("<pre>". print_r($form['adserve_display_url'], 1) . "</pre>");
+  $form['#after_build'][] = 'adserve_after_build';
+} 
+function adserve_after_build($form, &$form_state) {  
+  $form['adserve_weight']['#prefix'] = "<div id='adserve-optional'>"; 
+  $form['adserve_cookie_url']['#suffix'] = "</div>"; 
+  $form['title']['#prefix'] = "<div id='adserve-ad-example'></div>".
+     "<div id='adserve-required'>"; 
+  $form['adserve_target_url']['#suffix'] = "</div>"; 
+  $form['adserve_weight']['#default_value'] = "1";
+  return $form;
+}
+
+
+
+/**
+ * Implements hook_node_insert().
+ *
+ * As a new node is being inserted into the database, we need to do our own
+ * database inserts.
+ */
+function adserve_node_insert($node) { 
+  //drupal_set_message("adserve_node_insert({$node->type})");
+  if ($node->type != 'adserve') return; 
+  
+  // we can have multiple cookie rows, delimit with comma
+  $cookies = array();
+  foreach ($node->adserve_cookie_url[LANGUAGE_NONE] as $cookie) $cookies[] = $cookie['value'];
+  $cookies = implode(',', $cookies);
+    
+  db_insert('adserve_ad')
+    ->fields(array(
+        'adid' => $node->nid,
+        'display_title' => $node->title,
+        'display_text' => $node->adserve_display_desc[LANGUAGE_NONE][0]['value'],
+        'display_url' => $node->adserve_display_url[LANGUAGE_NONE][0]['value'],
+        'url' => $node->adserve_target_url[LANGUAGE_NONE][0]['value'],
+        'cookie_urls' => $cookies,
+        'weight' => $node->adserve_weight[LANGUAGE_NONE][0]['value'],
+        'uid' => $node->uid, 
+    ))
+    ->execute(); 
+}
+
+/**
+ * Implements hook_node_delete().
+ *
+ * When a node is deleted, we need to remove all related records from our table,
+ * including all revisions. For the delete operations we use node->nid.
+ */
+function adserve_node_delete($node) {
+  // Notice that we're deleting even if the content type has no rating enabled.
+  db_delete('adserve_ad')
+    ->condition('adid', $node->nid)
+    ->execute();
+}
+
+/**
+ * Implements hook_node_update().
+ *
+ * As an existing node is being updated in the database, we need to do our own
+ * database updates.
+ *
+ * This hook is called when an existing node has been changed. We can't simply
+ * update, since the node may not have a rating saved, thus no
+ * database field. So we first check the database for a rating. If there is one,
+ * we update it. Otherwise, we call nodeapi_example_node_insert() to create one.
+ */
+function adserve_node_update($node) {
+  //drupal_set_message("adserve_node_update({$node->type})");
+  if ($node->type != 'adserve') return;  
+    // Check first if this node record exists. 
+    $exists = db_query('SELECT * FROM {adserve_ad} WHERE adid=:nid', array(':nid' => $node->nid))->fetchField();
+    
+      // we can have multiple cookie rows, delimit with comma
+    $cookies = array();
+    foreach ($node->adserve_cookie_url[LANGUAGE_NONE] as $cookie) $cookies[] = $cookie['value'];
+    $cookies = implode(',', $cookies);
+
+    if ($exists) { 
+      db_update('adserve_ad')
+        ->fields(array( 
+          'display_title' => $node->title,
+          'display_text' => $node->adserve_display_desc[LANGUAGE_NONE][0]['value'],
+          'display_url' => $node->adserve_display_url[LANGUAGE_NONE][0]['value'],
+          'url' => $node->adserve_target_url[LANGUAGE_NONE][0]['value'],
+          'cookie_urls' => $cookies,
+          'weight' => $node->adserve_weight[LANGUAGE_NONE][0]['value'],
+          'uid' => $node->uid, 
+        ))
+        ->condition('adid', $node->nid)
+        ->execute();
+    }
+    else { 
+      adserve_node_insert($node);
+    } 
+}
+
+/** 
+ * Implements hook_view
+ * 
+ * Lets us replace body text with the generated ad
+ * Maybe we'll ad in some stats about the impressions and CTR as well
+ */
+function adserve_node_view($node, $build_mode = 'full') {
+  drupal_add_css(drupal_get_path('module', 'adserve') . '/adserve_form.css');
+  //drupal_set_message("adserve_node_view({$node->type})");
+  if ($node->type != 'adserve') return;  
+  // Make sure to set a rating, also for nodes saved previously and not yet rated. 
+  $ad_block =  theme('adserve_ad_block', array( 
+      'format' => 'leaderboard', 
+       //  'style' => 'adserve_glow',
+      'adid' => $node->nid,
+  ));
+  $ad_block .= '<br><br>';
+  $ad_block .=  theme('adserve_ad_block', array( 
+      'format' => 'single', 
+       //  'style' => 'adserve_glow',
+      'adid' => $node->nid,
+  ));
+      
+  $node->content['adserve_leaderboard'] = array(
+    '#markup' => $ad_block,
+    '#weight' => -9,
+  ); 
+  unset($node->content['adserve_display_desc']);
+  unset($node->content['adserve_display_url']);
+  //drupal_set_message("<pre>". print_r($node->content['adserve_ad'], 1) . "</pre>");
+  return $node;
+}
+
+/**
+ * Implements hook_node_load().
+ * 
+ *  Add a couple extra properties to our nodes
+ */
+function adserve_node_load($nodes, $types) {
+  if (!in_array('adserve', $types)) return; 
+  // get nids list
+  foreach ($nodes as $node) $nids[] = $node->nid;  
+  // get adserve records matching these nids
+  $records = db_query("SELECT adid, total_clicks, total_ctr FROM {adserve_ad} WHERE adid in (:nids)", array(":nids" => $nids));
+  // add adserve values to these nodes
+  foreach ($records as $record) {
+    $nodes[$record->nid]->total_clicks = $record->total_clicks;
+    $nodes[$record->nid]->total_ctr = $record->total_ctr; 
+  }
+}
+
+
+
+/**
+ * Implements hook_theme().
+ *
+ * This lets us tell Drupal about our theme functions and their arguments.
+ */
+function adserve_theme() {
+  return array( 
+    'adserve_ad_block' => array(
+       'variables' => array('format' => NULL, 'style' => NULL, 'adid' => NULL),
+    ), 
+  );
+} 
+function theme_adserve_ad_block($variables) {  
+  include_once(drupal_get_path('module', 'adserve') . '/' . 'adserve_format.class.php');
+  $template = adserve_format::ad_tempates($variables['format']);  
+  $ad = _adserve_ad($variables['format'], $variables['style'], $variables['adid'], 
+     $template['width'], $template['height']);  
+  return $ad;
+}
+
+function _adserve_ad($format, $style, $adid=0, $width=0, $height=0) {    
+  $css = ($width && $height) ? " width:{$width}px; height:{$height}px;" : "";
+  $css = " style='position:relative; padding:0;{$css}'"; 
+  $adid = $adid ? " data-adid='{$adid}'" : '';
+  $ad =  "<div class='adserve' data-format='{$format}' data-style='{$style}' {$adid} {$css}> 
+   <div class='ad {$format} {$style}' style='position: absolute;'>Hello World</div></div>";
+  return $ad;
+}
+
+ 
+
+/**
+ * Implements hook_footer(). ().
+ */
+function adserve_init() { 
+  // insert js into node pages 
+  $nid = (arg(0)=='node') ? (int) arg(1) : 0; 
+  $params = "p={$nid}&url=" . urlencode(url('node/'. $nid, array('absolute' => TRUE)));
+  $adserve_url = $GLOBALS['base_url'] . "/" . drupal_get_path('module', 'adserve') . '/adserve.php' . '?' . $params;  
+  $adserve_js = $GLOBALS['base_url'] . "/" . drupal_get_path('module', 'adserve') . '/adserve.js';
+    
+  // this header part provides the customized variable 'adserve_url' with page info  
+  drupal_add_js(" var adserve_url  = '{$adserve_url}';  ", array(
+      'type' => 'inline', 
+      'scope' => 'footer',
+      'group' => JS_DEFAULT,
+      'every_page' => TRUE,
+  ));  
+  
+  // this footer part does the fetching ad replacement and will be replaced later with an external file
+  drupal_add_js($adserve_js, array(
+      'type' => 'file', 
+      'scope' => 'footer',
+      'group' => JS_DEFAULT,
+      'every_page' => TRUE,
+      'cache' => TRUE, 
+  )); 
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
