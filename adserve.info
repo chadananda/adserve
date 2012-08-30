@@ -2,4 +2,4 @@ name = Ad Serve
 description = Simple Ad Server with A/B split testing and automatic optimization
 core = 7.x   
 configure = admin/config/system/adserver 
-package = "* Link Collaboration Tools"
+package = "* King of Content"
